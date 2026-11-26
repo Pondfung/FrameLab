@@ -67,7 +67,7 @@ def dependencies(torch_wheel):
         # Torch already ships the CUDA DLLs. CuPy also needs the matching headers for NVRTC.
         execute(*pip, "-r", headless, "-r", GIMM / "requirements.txt",
                 "vsbasicvsrpp==3.0.0", "vsrife==5.7.0", "vapoursynth==82",
-                "cupy-cuda12x==14.2.0", "nvidia-cuda-runtime-cu12==12.8.*")
+                "cupy-cuda12x==14.2.0", "nvidia-cuda-runtime-cu12==12.8.*", "opencv-python==5.1.0.95")
     execute(PYTHON, "-m", "pip", "check")
 
 
@@ -142,11 +142,19 @@ def main():
     models = commands.add_parser("weights")
     models.add_argument("model", choices=("all", "gimm-vfi", "seedvr2"), default="all", nargs="?")
     commands.add_parser("seedvr2-7b", help="install the optional SeedVR2 7B FP16 backend and weights")
+    vfx = commands.add_parser("nvidia-vfx", help="install NVIDIA VSR Ultra and VFG High")
+    vfx.add_argument("--wheel", type=Path)
     args = parser.parse_args()
     if args.command == "deps":
         dependencies(args.torch_wheel)
     elif args.command == "seedvr2-7b":
         seedvr2_7b()
+    elif args.command == "nvidia-vfx":
+        if not PYTHON.exists():
+            raise FileNotFoundError("Run python setup_runtime.py deps first")
+        target = ROOT / "vfx-deps"
+        execute(PYTHON, "-m", "pip", "--disable-pip-version-check", "install", "--no-deps", "--only-binary=:all:",
+                "--target", target, "--index-url", "https://pypi.nvidia.com", args.wheel or "nvidia-vfx==0.2.0.0")
     else:
         weights(args.model)
 

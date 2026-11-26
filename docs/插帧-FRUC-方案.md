@@ -1,5 +1,7 @@
 # 插帧 · NVOFA FRUC 方案（速度优先引擎）
 
+> LiveCard 历史参考。本文的安装、接口和数据对应实时采集项目。FrameLab 当前的引擎和用法见 [选型计划](离线视频超分与插帧-选型与开发计划.md) 与 [README](../README.md)。
+
 更新：2026-11-23　|　代码：`native/fruc/fruc_ffi.cpp` + `livecard/src/fruc.rs` + `livecard/src/interp.rs`
 
 RIFE 之外的第二套插帧引擎。RIFE 走 ncnn + Vulkan、画质好但慢（1080p 24.8 ms）；FRUC 走

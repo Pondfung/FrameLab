@@ -1,12 +1,15 @@
 import argparse
 from fractions import Fraction
 import json
+from math import ceil
+import os
 from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parent
+BUNDLED_BIN = os.environ.get("FRAMELAB_BUNDLED_BIN")
 SAMPLES = (
     ("cranes", "湖面如镜，白鹤伴飞2-许负1级.mp4", []),
     ("banchao", "班超_20260817_113713_fengyutang.mp4", [245]),
@@ -14,11 +17,19 @@ SAMPLES = (
     ("chentang", "陈汤_2级_partA_0811-1.mp4", []),
     ("hanxin", "韩信_2级_PART_A_0720.mp4", [448]),
 )
-SPATIAL = {"basicvsrpp", "seedvr2", "seedvr2-7b", "lanczos"}
-TEMPORAL = {"gimm-vfi", "rife", "hold"}
+SPATIAL = {"basicvsrpp", "seedvr2", "seedvr2-7b", "lanczos", "nvidia-vsr"}
+TEMPORAL = {"gimm-vfi", "rife", "hold", "nvidia-vfg"}
+if BUNDLED_BIN:
+    SPATIAL = {"nvidia-vsr"}
+    TEMPORAL = {"nvidia-vfg"}
+NVIDIA_VFX = {"nvidia-vsr", "nvidia-vfg"}
+NVENC = ("-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18", "-b:v", "0",
+         "-colorspace", "bt709", "-color_range", "tv")
 
 
 def command(tool, *args):
+    if BUNDLED_BIN and tool in ("ffmpeg", "ffprobe"):
+        tool = str(Path(BUNDLED_BIN) / f"{tool}.exe")
     return [tool, *map(str, args)]
 
 
@@ -36,7 +47,7 @@ def same_rate(first, second):
     return first > 0 and second > 0 and abs(1 / first - 1 / second) <= Fraction(10, 10**9)
 
 
-def probe(path, *, count=False, timing=False, expected_rate=None):
+def probe(path, *, count=False, timing=False, expected_rate=None, allow_tail_gap=False):
     args = ["-count_frames"] if count else []
     data = json.loads(run("ffprobe", "-v", "error", *args, "-show_streams", "-of", "json", path))
     video = next((stream for stream in data["streams"] if stream["codec_type"] == "video"
@@ -45,20 +56,30 @@ def probe(path, *, count=False, timing=False, expected_rate=None):
         raise ValueError(f"No video stream in {path}")
     if timing:
         frames = json.loads(run(
-            "ffprobe", "-v", "error", "-select_streams", str(video["index"]), "-show_frames",
+            "ffprobe", "-v", "error", "-threads", "0", "-select_streams", str(video["index"]), "-show_frames",
             "-show_entries", "frame=best_effort_timestamp", "-of", "json", path,
         ))["frames"]
         timestamps = [int(frame["best_effort_timestamp"]) for frame in frames]
         time_base = Fraction(video["time_base"])
         rate = Fraction(expected_rate or video["avg_frame_rate"])
-        # MP4 and Matroska can round PTS to their own timestamp grid.
-        video["constant_grid"] = bool(timestamps and rate) and all(
-            abs((pts - timestamps[0]) - Fraction(i, 1) / rate / time_base) <= 1
-            for i, pts in enumerate(timestamps)
-        )
+        video["constant_grid"] = bool(timestamps and rate) and constant_grid(
+            timestamps, 1 / rate / time_base, video, allow_tail_gap=allow_tail_gap)
         video["decoded_frames"] = len(timestamps)
     return {"video": video, "audio": [s for s in data["streams"] if s["codec_type"] == "audio"],
             "subtitles": [s for s in data["streams"] if s["codec_type"] == "subtitle"]}
+
+
+def constant_grid(timestamps, step, video, *, allow_tail_gap):
+    first, last = timestamps[0], timestamps[-1]
+    span = len(timestamps) * step
+    # A recording can place its final frame at the declared end instead of
+    # one frame before it. Decode that frame in order into the last CFR slot.
+    tail_gap = (allow_tail_gap and len(timestamps) >= 3
+                and video.get("start_pts") == first and video.get("duration_ts") is not None
+                and abs(int(video["duration_ts"]) - span) <= 1 and abs(last - first - span) <= 1)
+    # MP4 and Matroska can round PTS to their own timestamp grid.
+    return all(abs(pts - first - i * step) <= 1
+               for i, pts in enumerate(timestamps[:-1] if tail_gap else timestamps))
 
 
 def publish(file, destination):
@@ -113,12 +134,30 @@ def check_output(path, rate, count, size):
         raise ValueError(f"Output validation failed for {path}: expected {expected}, got {actual}")
 
 
-def decoder(path, video, first, stop):
+def cfr_filter(rate, target, count, first=0):
+    timeline = f"settb={rate.denominator}/{rate.numerator},setpts=N"
+    if rate != target:
+        tail = max(1, -(-rate // target))
+        timeline += (f",tpad=stop_mode=clone:stop={tail},fps={target}:start_time=0,"
+                     f"trim=start_frame={first}:end_frame={count}")
+    return timeline
+
+
+def decoder(path, video, first, stop, *, playlist=False, retime=None):
     color_range = "full" if video.get("color_range") == "pc" or video["pix_fmt"] in ("yuvj420p", "gbrp16le") else "limited"
-    vf = (f"trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS,"
-          f"scale=in_color_matrix=bt709:in_range={color_range},format=rgb48le")
+    if retime is None and not playlist:
+        timeline = f"trim=start_frame={first}:end_frame={stop},setpts=PTS-STARTPTS"
+    elif retime is None:
+        rate = Fraction(video["avg_frame_rate"])
+        timestamps = cfr_filter(rate, rate, stop)
+        timeline = f"trim=start_frame={first}:end_frame={stop},{timestamps}"
+    else:
+        timeline = cfr_filter(Fraction(video["avg_frame_rate"]), retime, stop, first)
+    vf = f"{timeline},scale=in_color_matrix=bt709:in_range={color_range},format=rgb48le"
+    input_options = ("-f", "concat", "-safe", "1") if playlist else ()
     return command("ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
-                   "-threads", "2", "-i", path, "-map", f"0:{video['index']}", "-vf", vf, "-an",
+                   "-threads", "2", *input_options,
+                   "-i", path, "-map", f"0:{video['index']}", "-vf", vf, "-an",
                    "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb48le", "-threads:v", "1", "-")
 
 
@@ -154,17 +193,23 @@ def render_spec(args, video):
     if not 0 <= args.start_frame < stop or args.chunk < 1 or args.overlap < 0:
         raise ValueError("Invalid frame range or chunk parameters")
     width, height = video["width"], video["height"]
-    out_rate = Fraction(video["avg_frame_rate"]) * (2 if args.engine in TEMPORAL else 1)
+    input_rate = Fraction(video["avg_frame_rate"])
+    out_rate = input_rate * (2 if args.engine in TEMPORAL else 1)
+    if args.engine == "nvidia-vfg" and getattr(args, "target_rate", None):
+        out_rate = Fraction(args.target_rate)
     internal_size = (width * 4, height * 4) if args.engine == "basicvsrpp" else (width, height)
     requested_size = args.size or internal_size
     if args.engine in TEMPORAL and args.size:
         raise ValueError("--size applies to upscaling engines")
-    if args.engine in ("lanczos", "seedvr2", "seedvr2-7b") and not args.size:
+    if args.engine in ("lanczos", "seedvr2", "seedvr2-7b", "nvidia-vsr") and not args.size:
         raise ValueError(f"{args.engine} requires --size WIDTHxHEIGHT")
-    if args.engine in ("seedvr2", "seedvr2-7b"):
+    if args.engine in ("seedvr2", "seedvr2-7b", "nvidia-vsr"):
         internal_size = requested_size
     if args.engine == "seedvr2-7b" and args.size[0] * height != args.size[1] * width:
         raise ValueError("SeedVR2 7B requires a target matching the input aspect ratio")
+    if args.engine == "nvidia-vsr" and (requested_size == (width, height)
+                                         or requested_size[0] < width or requested_size[1] < height):
+        raise ValueError("NVIDIA VSR Ultra requires an output larger than the input")
     return stop, out_rate, internal_size, requested_size
 
 
@@ -175,8 +220,30 @@ def blocks(start, stop, cuts, chunk):
             yield left, right, first, min(first + chunk, right)
 
 
-def infer_block(args, read, engine, internal_size, left, right, first, last):
-    if args.engine in TEMPORAL:
+def output_index(frame, start, stop, input_rate, output_rate):
+    index = (frame - start) * output_rate / input_rate
+    # Each block owns output timestamps before its end; round only the full clip duration.
+    return max(1, int(index + Fraction(1, 2))) if frame == stop else ceil(index)
+
+
+def infer_block(args, read, engine, internal_size, left, right, first, last, *, input_rate, output_rate, stop,
+                review=None, repair_slots=(), replacement=None):
+    if args.engine == "nvidia-vfg":
+        # Include the next anchor across a chunk boundary, stopping at the end of the shot.
+        frames = read(first, min(last + 1, right))
+        start = args.start_frame
+        first_out = output_index(first, start, stop, input_rate, output_rate)
+        last_out = output_index(last, start, stop, input_rate, output_rate)
+        positions = (i * input_rate / output_rate + start - first for i in range(first_out, last_out))
+        if repair_slots:
+            selected = {i * input_rate / output_rate + start - first for i in repair_slots}
+            yield from engine(frames, positions, review=review, selected=selected, replacement=replacement)
+        elif review is None:
+            yield from engine(frames, positions)
+        else:
+            yield from engine(frames, positions, review=review)
+    elif args.engine in TEMPORAL:
+        # This adapter contract returns one midpoint per adjacent pair on each 2x pass.
         frames = read(first, min(last + 1, right))
         generated = engine(frames)
         if len(generated) != len(frames) - 1:
@@ -200,18 +267,27 @@ def infer_block(args, read, engine, internal_size, left, right, first, last):
             yield frame
 
 
-def encode_frames(path, frames, rate, internal_size, size):
+def encode_frames(path, frames, rate, internal_size, size, *, nvenc=False):
     inputs = f"{internal_size[0]}x{internal_size[1]}"
     target = f"{size[0]}:{size[1]}"
+    if nvenc:
+        filters = ("scale=in_range=full:out_color_matrix=bt709:out_range=limited,"
+                   "format=yuv420p,setsar=1")
+        if internal_size != size:
+            filters = f"scale={target}:flags=lanczos,setsar=1,format=gbrp16le,{filters}"
+        # Each independently decodable segment uses presentation-order packets.
+        codec = (*NVENC, "-bf", "0", "-video_track_timescale", rate.numerator)
+    else:
+        filters = f"scale={target}:flags=lanczos,setsar=1,format=gbrp16le"
+        codec = ("-color_range", "pc", "-c:v", "ffv1")
     with TemporaryDirectory(dir=path.parent) as scratch:
         log = Path(scratch) / "encoder.log"
         with log.open("wb") as errors:
             process = subprocess.Popen(command(
                 "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
                 "-f", "rawvideo", "-pixel_format", "rgb48le", "-video_size", inputs, "-framerate", str(rate),
-                "-i", "-", "-an", "-vf", f"scale={target}:flags=lanczos,setsar=1,format=gbrp16le",
-                "-color_range", "pc", "-color_primaries", "bt709", "-color_trc", "bt709",
-                "-c:v", "ffv1", path,
+                "-i", "-", "-an", "-vf", filters,
+                "-color_primaries", "bt709", "-color_trc", "bt709", *codec, path,
             ), stdin=subprocess.PIPE, stderr=errors)
             try:
                 for frame in frames:
@@ -219,6 +295,10 @@ def encode_frames(path, frames, rate, internal_size, size):
                 process.stdin.close()
                 if process.wait() != 0:
                     raise RuntimeError(log.read_text(encoding="utf-8", errors="replace"))
+            except BrokenPipeError as exc:
+                process.wait()
+                diagnostic = log.read_text(encoding="utf-8", errors="replace").strip()
+                raise RuntimeError(diagnostic or f"FFmpeg closed its input: {process.returncode}") from exc
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -230,26 +310,28 @@ def render(args):
         raise FileExistsError(args.output)
     if args.output.suffix.lower() != ".mkv":
         raise ValueError("Use an .mkv destination for this FFV1 evaluator")
-    video = probe(args.input, timing=True)["video"]
+    video = probe(args.input, timing=True, allow_tail_gap=True)["video"]
     stop, out_rate, internal_size, requested_size = render_spec(args, video)
     total = video["decoded_frames"]
 
     from engines import make_engine
 
-    engine = make_engine(args, Fraction(video["avg_frame_rate"]))
+    input_rate = Fraction(video["avg_frame_rate"])
+    engine = make_engine(args, input_rate)
     def read(first, last):
         return decode(args.input, video, first, last)
 
     def frames():
         for left, right, first, last in blocks(args.start_frame, stop, args.cut_frame, args.chunk):
-            yield from infer_block(args, read, engine, internal_size, left, right, first, last)
+            yield from infer_block(args, read, engine, internal_size, left, right, first, last,
+                                   input_rate=input_rate, output_rate=out_rate, stop=stop)
             print(f"{args.engine}: frames {first}..{last-1}", flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=args.output.parent) as scratch:
         staged = Path(scratch) / "video.mkv"
         encode_frames(staged, frames(), out_rate, internal_size, requested_size)
-        expected = (stop - args.start_frame) * (2 if args.engine in TEMPORAL else 1)
+        expected = output_index(stop, args.start_frame, stop, input_rate, out_rate)
         check_output(staged, out_rate, expected, requested_size)
         if args.start_frame == 0 and stop == total and Fraction(video.get("start_time", "0")) == 0:
             muxed = Path(scratch) / "with-audio.mkv"
@@ -284,6 +366,7 @@ def score(args):
         last = first + count
         steps = [f"trim=start_frame={first}:end_frame={last}"]
         if args.inserted_only:
+            # Odd slots are midpoints only on an aligned 2x grid. Exclude the terminal hold.
             steps.extend([r"select=mod(n\,2)", f"trim=end_frame={(count-1)//2}"])
         # Identical timestamps and sample encoding on both branches.
         steps.extend(["scale=out_color_matrix=bt709:out_range=limited", "format=yuv420p",
@@ -339,6 +422,8 @@ def model_options(parser):
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--frames", type=int)
     parser.add_argument("--cut-frame", type=int, action="append", default=[])
+    parser.add_argument("--no-vfg-sdk-shot-detection", dest="vfg_sdk_shot_detection", action="store_false",
+                        help="disable VFG's automatic shot detector for comparisons with explicit cut frames")
     parser.add_argument("--chunk", type=int, default=8)
     parser.add_argument("--overlap", type=int, default=2)
     parser.add_argument("--tile", type=int, default=192, help="Input tile edge for BasicVSR++; 0 uses a full frame")
@@ -354,6 +439,8 @@ def main():
     subs = parser.add_subparsers(dest="action", required=True)
     metadata = subs.add_parser("probe")
     metadata.add_argument("input", type=Path)
+    cut_scan = subs.add_parser("vfg-cuts", help="report VFG hard-cut candidates without rendering")
+    cut_scan.add_argument("input", type=Path)
     prep = subs.add_parser("prepare")
     prep.add_argument("source", type=Path)
     prep.add_argument("output", type=Path)
@@ -375,6 +462,12 @@ def main():
     args = parser.parse_args()
     if args.action == "probe":
         print(json.dumps(probe(args.input, timing=True), ensure_ascii=False, indent=2))
+    elif args.action == "vfg-cuts":
+        from scene_detection import scan_cuts
+
+        source = args.input.resolve(strict=True)
+        video = probe(source, timing=True, allow_tail_gap=True)["video"]
+        print(json.dumps(scan_cuts(source, video), ensure_ascii=False, indent=2))
     elif args.action == "prepare":
         print(prepare(args.source, args.output))
     elif args.action == "score":
